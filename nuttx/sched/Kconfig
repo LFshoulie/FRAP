@@ -355,16 +355,6 @@ config FRAP_TABLE_SIZE
 	help
 	  Entries available for user-configured spin priority tuples.
 
-config FRAP_SPIN_ASSIGN
-        bool "Enable FRAP spin-priority assignment (FRAP Alg.2 Phase 1)"
-        depends on FRAP
-        default n
-        ---help---
-          Enable offline computation of per-(task,resource) spin priorities P_i^k
-          based on the FRAP paper Algorithm 2 (initialization phase). The
-          results are written into the FRAP spin-priority table via
-          frap_set_spin_prio().
-
 endif # FRAP
 
 config IRQCHAIN

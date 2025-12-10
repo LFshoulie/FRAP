@@ -39,20 +39,6 @@ struct frap_res
   uint8_t           ceiling;
 };
 
-/* 保留原有 waiter 结构供外部使用/调试。
- * 内部实现已经改为直接在 TCB 中嵌入队列结点和优先级信息，
- * 不再单独分配 waiter 结点池。
- */
-struct frap_waiter
-{
-  struct list_node  node;
-  FAR struct tcb_s *tcb;
-  uint8_t           base_prio;
-  uint8_t           spin_prio;
-  volatile bool     enqueued;
-  volatile bool     cancelled;
-};
-
 /* API：初始化资源。
  *
  *  - r        : 资源对象（由调用方提供存储）
@@ -85,41 +71,3 @@ int frap_set_spin_prio(int8_t spin_prio);
 int frap_get_spin_prio(void);
 
 #endif /* CONFIG_FRAP */
-
-#ifdef CONFIG_FRAP_SPIN_ASSIGN
-
-struct frap_task_cfg_s
-{
-  pid_t   pid;
-  uint8_t cpu;
-  uint8_t base_prio;
-  uint32_t C;
-  uint32_t T;
-  uint32_t D;
-};
-
-struct frap_res_cfg_s
-{
-  uint32_t resid;
-  uint32_t ck;
-};
-
-struct frap_access_cfg_s
-{
-  pid_t    pid;
-  uint32_t resid;
-  uint32_t Nk;
-};
-
-/* 离线自旋优先级分配入口：
- *  - 输入：任务表 / 资源表 / 访问模式表；
- *  - 内部：根据论文 Alg.2 第一阶段计算 P_i^k；
- *  - 输出：调用已有 frap_set_spin_prio(pid,resid,spin) 写进 g_tbl。
- *
- * 返回 0 表示成功，负值表示错误（EINVAL 等）。
- */
-int frap_assign_spin_prio(FAR const struct frap_task_cfg_s   *tasks,   int ntasks,
-                          FAR const struct frap_res_cfg_s    *ress,    int nres,
-                          FAR const struct frap_access_cfg_s *access,  int naccess);
-
-#endif /* CONFIG_FRAP_SPIN_ASSIGN */
