@@ -287,9 +287,11 @@ for cpu in list(tasks_by_cpu.keys()):
 
             # set Pk_l = Pi - 1 for all τl in llp(i)
             for lp in local_lp(task_i):
-                key = (lp["name"], best_r)
-                newp = max(0, task_i["P"] - 1)
-                Pcfg[key] = newp
+                # 只给真正请求过 best_r 的任务写 spin prio
+                if str(best_r) in lp.get("req", {}):
+                    key = (lp["name"], best_r)
+                    newp = max(0, task_i["P"] - 1)
+                    Pcfg[key] = newp
 
             # remove best_r from Fstar and repeat
             Fstar.discard(best_r)

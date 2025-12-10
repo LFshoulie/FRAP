@@ -23,7 +23,7 @@ static const struct frap_cfg_entry frap_generated_table[] = {
     { "remoteA1", 1, 119, 5 },
     { "remoteA1", 3, 119, 5 },
     { "remoteB0", 1, 240, 6 },
-    { "background", 3, 114, 7 }
+    { "background", 3, 114, 7 },
 };
 
 static const int frap_generated_table_len = sizeof(frap_generated_table)/sizeof(frap_generated_table[0]);
