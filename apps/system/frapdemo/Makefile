@@ -1,0 +1,10 @@
+include $(APPDIR)/Make.defs
+
+APPNAME   = frapdemo
+PROGNAME  = $(APPNAME)
+PRIORITY  = SCHED_PRIORITY_DEFAULT
+STACKSIZE = $(CONFIG_SYSTEM_FRAPDEMO_STACKSIZE)
+
+MAINSRC = frapdemo_main.c
+
+include $(APPDIR)/Application.mk

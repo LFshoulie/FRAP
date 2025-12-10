@@ -1,0 +1,12 @@
+config SYSTEM_FRAPDEMO
+    bool "frapdemo: FRAP protocol demo"
+    default n
+    depends on FRAP
+    ---help---
+      Simple demo for FRAP spin protocol (global resource, cancel-on-preempt).
+
+
+config SYSTEM_FRAPDEMO_STACKSIZE
+    int "Stack size"
+    default 4096
+    depends on SYSTEM_FRAPDEMO

@@ -1,0 +1,5 @@
+# apps/system/frapdemo/Make.defs
+# 把 frapdemo 注册到构建系统（被 apps/system/Make.defs 自动 include）
+ifeq ($(CONFIG_SYSTEM_FRAPDEMO),y)
+CONFIGURED_APPS += system/frapdemo
+endif
