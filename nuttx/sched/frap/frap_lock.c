@@ -94,11 +94,12 @@ int frap_lock(FAR struct frap_res *r)
           frap_queue_remove(r, tcb);
           r->owner = tcb;
 
-          spin_unlock_irqrestore(&r->sl, flags);
-
           /* R2: 非抢占执行临界段（同核不可被更高优先级打断） */
           sched_lock();
           tcb->frap_in_cs = true;
+
+          spin_unlock_irqrestore(&r->sl, flags);
+
 
           return OK;
         }

@@ -1,48 +1,72 @@
 /****************************************************************************
  * apps/system/frapdemo/frapdemo_main.c
  *
- * FRAP demo that uses frap_table_generated.h (produced by frap_table_generator.py)
- *
- * This demo creates 8 threads matching frap_demo_config.json:
- *  - hot0, hot1, mid0, mid1 on CPU0
- *  - remoteA0, remoteA1 on CPU1
- *  - remoteB0, background on CPU2
- *
- * The program applies the generated spin-priority table (frap_set_spin_prio)
- * using pid_hint to map entries to threads created in this program.
+ * FRAP demo + throughput & correctness verification.
+ * Modified: ensure each thread's scheduling priority is initialized to its
+ *           base priority (P_i) at thread creation time.
  *
  ****************************************************************************/
 
 #include <nuttx/config.h>
+#include <nuttx/frap.h>
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <pthread.h>
 #include <sched.h>
-#include <sys/types.h>
-#include <nuttx/frap.h>
+#include <time.h>
+#include <unistd.h>
+#include <string.h>
 
 #include "frap_table_generated.h"
 
-/* Number of worker threads (must match the JSON pid_hint indices) */
+/* ---------- parameters (match the JSON above) ---------- */
 #define WORKER_NUM 8
+#define RESOURCE_NUM 4
 
+/* loop counts (per-thread) - moderate values for a reasonable run time */
+static const int loops_for_worker[WORKER_NUM] = {
+  800, /* hot0 */
+  700, /* hot1 */
+  500, /* mid0 */
+  450, /* mid1 */
+  250, /* remoteA0 */
+  250, /* remoteA1 */
+  300, /* remoteB0 */
+  200  /* background */
+};
+
+/* resource counters (protected by non-preemptible CS when incremented) */
+static uint64_t g_counter[RESOURCE_NUM];
+
+/* FRAP resources global */
+static struct frap_res g_res[RESOURCE_NUM];
+
+/* created worker threads */
 static pthread_t workers[WORKER_NUM];
+/* per-worker spin-priority array (resource indexed) */
+static int worker_prios[WORKER_NUM][RESOURCE_NUM];
 
-/* Declare three global FRAP resources (IDs 0..3) */
-static struct frap_res g_r0;
-static struct frap_res g_r1;
-static struct frap_res g_r2;
-static struct frap_res g_r3;
+/* start barrier */
+static pthread_mutex_t start_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  start_cond = PTHREAD_COND_INITIALIZER;
+static int             start_flag = 0;
 
-/* Busy-wait helper (microsecond-like scale) */
-static void busy_work(unsigned loops)
-{
-  volatile unsigned long long s = 0;
-  while (loops--) s += loops;
-}
+/* Base priorities (P_i) for each worker (must match the JSON tasks' P fields) */
+static const int base_prio_of_worker[WORKER_NUM] = {
+  240, /* hot0 */
+  238, /* hot1 */
+  200, /* mid0 */
+  190, /* mid1 */
+  120, /* remoteA0 */
+  110, /* remoteA1 */
+  115, /* remoteB0 */
+  60   /* background */
+};
 
-/* Bind to CPU (if supported) */
+/* helper: pin to cpu if available */
 static void pin_to_cpu(int cpu)
 {
 #if defined(CONFIG_SMP) && defined(CONFIG_SCHED_CPUAFFINITY)
@@ -55,361 +79,388 @@ static void pin_to_cpu(int cpu)
 #endif
 }
 
-/* Worker routines - each corresponds to a task in the JSON (index == pid_hint) */
+/* busy work inside critical section (short loop) */
+static void busy_work(int iters)
+{
+  volatile unsigned long long s = 0;
+  while (iters--) s += iters;
+}
 
-/* hot0 (index 0): CPU0, frequently locks R0 and R1 with high spin-prio */
+/* wait until main releases workers */
+static void wait_for_start(void)
+{
+  pthread_mutex_lock(&start_lock);
+  while (!start_flag)
+    {
+      pthread_cond_wait(&start_cond, &start_lock);
+    }
+  pthread_mutex_unlock(&start_lock);
+}
+
+/* generic worker function dispatcher */
+typedef void *(*worker_fn_t)(void *);
 static void *worker_hot0(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_hot0 started on CPU0, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(0);
-  for (int i = 0; i < 800; i++)
-    {
-      frap_set_spin_prio(arr[0]); /* set spin prio for R0 */
-      frap_lock(&g_r0);
-      busy_work(2000);
-      frap_unlock(&g_r0);
+  printf("[worker_hot0] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
 
-      frap_set_spin_prio(arr[1]); /* set spin prio for R1 */
-      frap_lock(&g_r1);
-      busy_work(4000);
-      frap_unlock(&g_r1);
+  int loops = loops_for_worker[0];
+  for (int i = 0; i < loops; i++)
+    {
+      frap_set_spin_prio(arr[0]); /* R0 */
+      frap_lock(&g_res[0]);
+      busy_work(2000);
+      g_counter[0]++;
+      frap_unlock(&g_res[0]);
+
+      frap_set_spin_prio(arr[1]); /* R1 */
+      frap_lock(&g_res[1]);
+      busy_work(3500);
+      g_counter[1]++;
+      frap_unlock(&g_res[1]);
 
       usleep(1000);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_hot0 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* hot1 (index 1): CPU0, similar to hot0 slightly different timing */
 static void *worker_hot1(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_hot1 started on CPU0, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(0);
-  for (int i = 0; i < 700; i++)
-    {
-      frap_set_spin_prio(arr[0]); /* set spin prio for R0 */
-      frap_lock(&g_r0);
-      busy_work(1800);
-      frap_unlock(&g_r0);
+  printf("[worker_hot1] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
 
-      frap_set_spin_prio(arr[1]); /* set spin prio for R1 */
-      frap_lock(&g_r1);
-      busy_work(3500);
-      frap_unlock(&g_r1);
+  int loops = loops_for_worker[1];
+  for (int i = 0; i < loops; i++)
+    {
+      frap_set_spin_prio(arr[0]);
+      frap_lock(&g_res[0]);
+      busy_work(1800);
+      g_counter[0]++;
+      frap_unlock(&g_res[0]);
+
+      frap_set_spin_prio(arr[1]);
+      frap_lock(&g_res[1]);
+      busy_work(3200);
+      g_counter[1]++;
+      frap_unlock(&g_res[1]);
 
       usleep(1200);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_hot1 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* mid0 (index 2): CPU0, accesses R0 and R2, spin_prio == base (200) */
 static void *worker_mid0(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_mid0 started on CPU0, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(0);
-  for (int i = 0; i < 500; i++)
-    {
-      frap_set_spin_prio(arr[0]); /* set spin prio for R0 */
-      frap_lock(&g_r0);  /* P^k = base -> will be preempted by hot */
-      busy_work(3000);
-      frap_unlock(&g_r0);
+  printf("[worker_mid0] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
 
-      frap_set_spin_prio(arr[2]); /* set spin prio for R2 */
-      frap_lock(&g_r2);
+  int loops = loops_for_worker[2];
+  for (int i = 0; i < loops; i++)
+    {
+      frap_set_spin_prio(arr[0]);
+      frap_lock(&g_res[0]);
+      busy_work(3000);
+      g_counter[0]++;
+      frap_unlock(&g_res[0]);
+
+      frap_set_spin_prio(arr[2]);
+      frap_lock(&g_res[2]);
       busy_work(2500);
-      frap_unlock(&g_r2);
+      g_counter[2]++;
+      frap_unlock(&g_res[2]);
 
       usleep(1500);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_mid0 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* mid1 (index 3): CPU0, accesses R2 and R3, R3 is long critical section */
 static void *worker_mid1(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_mid1 started on CPU0, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(0);
-  for (int i = 0; i < 450; i++)
-    {
-      frap_set_spin_prio(arr[2]); /* set spin prio for R2 */
-      frap_lock(&g_r2);
-      busy_work(2400);
-      frap_unlock(&g_r2);
+  printf("[worker_mid1] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
 
-      frap_set_spin_prio(arr[3]); /* set spin prio for R3 */
-      frap_lock(&g_r3);
-      busy_work(8000); /* long critical section to emphasize btilde*c */
-      frap_unlock(&g_r3);
+  int loops = loops_for_worker[3];
+  for (int i = 0; i < loops; i++)
+    {
+      frap_set_spin_prio(arr[2]);
+      frap_lock(&g_res[2]);
+      busy_work(2400);
+      g_counter[2]++;
+      frap_unlock(&g_res[2]);
+
+      frap_set_spin_prio(arr[3]);
+      frap_lock(&g_res[3]);
+      busy_work(8000);
+      g_counter[3]++;
+      frap_unlock(&g_res[3]);
 
       usleep(2000);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_mid1 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* remoteA0 (index 4): CPU1, accesses R1 (low freq) */
 static void *worker_remoteA0(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_remoteA0 started on CPU1, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(1);
-  for (int i = 0; i < 250; i++)
+  printf("[worker_remoteA0] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
+
+  int loops = loops_for_worker[4];
+  for (int i = 0; i < loops; i++)
     {
-      frap_set_spin_prio(arr[1]); /* set spin prio for R1 */
-      frap_lock(&g_r1);
+      frap_set_spin_prio(arr[1]);
+      frap_lock(&g_res[1]);
       busy_work(3000);
-      frap_unlock(&g_r1);
+      g_counter[1]++;
+      frap_unlock(&g_res[1]);
+
       usleep(4000);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_remoteA0 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* remoteA1 (index 5): CPU1, accesses R1 and R3 */
 static void *worker_remoteA1(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_remoteA1 started on CPU1, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(1);
-  for (int i = 0; i < 220; i++)
-    {
-      frap_set_spin_prio(arr[1]); /* set spin prio for R1 */
-      frap_lock(&g_r1);
-      busy_work(3200);
-      frap_unlock(&g_r1);
+  printf("[worker_remoteA1] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
 
-      frap_set_spin_prio(arr[3]); /* set spin prio for R3 */
-      frap_lock(&g_r3);
+  int loops = loops_for_worker[5];
+  for (int i = 0; i < loops; i++)
+    {
+      frap_set_spin_prio(arr[1]);
+      frap_lock(&g_res[1]);
+      busy_work(3200);
+      g_counter[1]++;
+      frap_unlock(&g_res[1]);
+
+      frap_set_spin_prio(arr[3]);
+      frap_lock(&g_res[3]);
       busy_work(6000);
-      frap_unlock(&g_r3);
+      g_counter[3]++;
+      frap_unlock(&g_res[3]);
 
       usleep(5000);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_remoteA1 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* remoteB0 (index 6): CPU2, heavier on R1 (requests twice per period in JSON) */
 static void *worker_remoteB0(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_remoteB0 started on CPU2, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(2);
-  for (int i = 0; i < 200; i++)
+  printf("[worker_remoteB0] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
+
+  int loops = loops_for_worker[6];
+  for (int i = 0; i < loops; i++)
     {
-      /* simulate two quick requests per cycle */
-      frap_set_spin_prio(arr[1]); /* set spin prio for R1 */
-      frap_lock(&g_r1);
+      /* remoteB0 requests R1 twice per loop to increase remote contention */
+      frap_set_spin_prio(arr[1]);
+      frap_lock(&g_res[1]);
       busy_work(2200);
-      frap_unlock(&g_r1);
+      g_counter[1]++;
+      frap_unlock(&g_res[1]);
 
-      usleep(1000);
-
-      frap_set_spin_prio(arr[1]); /* set spin prio for R1 */
-      frap_lock(&g_r1);
+      frap_set_spin_prio(arr[1]);
+      frap_lock(&g_res[1]);
       busy_work(2200);
-      frap_unlock(&g_r1);
+      g_counter[1]++;
+      frap_unlock(&g_res[1]);
 
       usleep(3000);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_remoteB0 finished\n");
+  free(arg);
   return NULL;
 }
 
-/* background (index 7): CPU2, occasional R3 access */
 static void *worker_background(void *arg)
 {
   int *arr = (int *)arg;
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_background started on CPU2, spin_prio: "
-         "R0=%d R1=%d R2=%d R3=%d\n",
-         arr[0], arr[1], arr[2], arr[3]);
-
   pin_to_cpu(2);
-  for (int i = 0; i < 120; i++)
+  printf("[worker_background] start; prios R0..R3 = %d %d %d %d\n",
+         arr[0], arr[1], arr[2], arr[3]);
+  wait_for_start();
+
+  int loops = loops_for_worker[7];
+  for (int i = 0; i < loops; i++)
     {
-      frap_set_spin_prio(arr[3]); /* set spin prio for R3 */
-      frap_lock(&g_r3);
+      frap_set_spin_prio(arr[3]);
+      frap_lock(&g_res[3]);
       busy_work(2000);
-      frap_unlock(&g_r3);
+      g_counter[3]++;
+      frap_unlock(&g_res[3]);
       usleep(7000);
     }
-
-  /* DEBUG */
-  printf("[FRAPDEMO] worker_background finished\n");
+  free(arg);
   return NULL;
 }
 
-/* mapping pid_hint index -> worker function */
-static void *(*worker_table[WORKER_NUM])(void *) = {
-  worker_hot0,      /* pid_hint 0 */
-  worker_hot1,      /* pid_hint 1 */
-  worker_mid0,      /* pid_hint 2 */
-  worker_mid1,      /* pid_hint 3 */
-  worker_remoteA0,  /* pid_hint 4 */
-  worker_remoteA1,  /* pid_hint 5 */
-  worker_remoteB0,  /* pid_hint 6 */
-  worker_background /* pid_hint 7 */
+/* worker table (index by pid_hint) */
+static worker_fn_t worker_table[WORKER_NUM] = {
+  worker_hot0,
+  worker_hot1,
+  worker_mid0,
+  worker_mid1,
+  worker_remoteA0,
+  worker_remoteA1,
+  worker_remoteB0,
+  worker_background
 };
 
 int main(int argc, char *argv[])
 {
-  (void)argc;
-  (void)argv;
-  printf("\n[FRAPDEMO] Starting generated FRAP demo...\n");
+  (void)argc; (void)argv;
+  printf("[FRAPTEST] starting demo (throughput + correctness check)\n");
 
-  /* init FRAP resources matching config ids */
-  frap_res_init(&g_r0, 0, true);
-  frap_res_init(&g_r1, 1, true);
-  frap_res_init(&g_r2, 2, true);
-  frap_res_init(&g_r3, 3, true);
+  /* init resources */
+  for (int i = 0; i < RESOURCE_NUM; i++)
+    {
+      frap_res_init(&g_res[i], i, true);
+      g_counter[i] = 0;
+    }
 
-  /* Apply generated FRAP spin-priority table (frap_generated_table) */
-  printf("[FRAPDEMO] Applying generated FRAP spin-priority table...\n");
-  int arrs[WORKER_NUM][4] = {0};
+  /* fill worker_prios with defaults (base) */
+  for (int i = 0; i < WORKER_NUM; i++)
+    {
+      for (int r = 0; r < RESOURCE_NUM; r++)
+        worker_prios[i][r] = 0; /* default 0 = will be overwritten */
+    }
+
+  /* apply the generated table into per-worker arrays */
   for (int e = 0; e < frap_generated_table_len; e++)
     {
       const struct frap_cfg_entry *ent = &frap_generated_table[e];
       int idx = ent->pid_hint;
       if (idx < 0 || idx >= WORKER_NUM)
-        {
-          printf("  SKIP invalid pid_hint %d\n", idx);
-          continue;
-        }
-      arrs[idx][ent->resid] = ent->spin_prio;
+        continue;
+      if (ent->resid >= 0 && ent->resid < RESOURCE_NUM)
+        worker_prios[idx][ent->resid] = ent->spin_prio;
     }
 
-  printf("===== spin_prio arrs table =====\n");
-  printf("      ");
-  for (int r = 0; r < 4; r++)
-    {
-      printf(" R%d ", r);
-    }
-  printf("\n");
+  /* For any missing entries, fill with base-priority defaults (simple fallback) */
+  // for (int i = 0; i < WORKER_NUM; i++)
+  //   {
+  //     int base_prio = base_prio_of_worker[i];
+  //     for (int r = 0; r < RESOURCE_NUM; r++)
+  //       {
+  //         if (worker_prios[i][r] == 0)
+  //           worker_prios[i][r] = base_prio;
+  //       }
+  //   }
 
-  for (int i = 0; i < WORKER_NUM; i++)
-    {
-      printf("T%02d: ", i);
-      for (int r = 0; r < 4; r++)
-        {
-          printf("%3d ", arrs[i][r]);
-        }
-      printf("\n");
-    }
-
-  printf("=================================\n");
-
-  /* create worker threads in the same order as pid_hint in JSON */
+  /* create threads (pass pointer to their prio array) */
   for (int i = 0; i < WORKER_NUM; i++)
     {
       pthread_attr_t attr;
+      struct sched_param param;
       pthread_attr_init(&attr);
 
-      struct sched_param param;
-      /* Set a reasonable scheduling priority mapping for threads:
-       * For demonstration we set thread base priority around values used in JSON.
-       * Note: actual kernel priority interpretation must match P values in JSON.
-       */
-      int base_prio = 50;
-      switch (i)
-        {
-          case 0: base_prio = 240; break;
-          case 1: base_prio = 238; break;
-          case 2: base_prio = 200; break;
-          case 3: base_prio = 190; break;
-          case 4: base_prio = 120; break;
-          case 5: base_prio = 110; break;
-          case 6: base_prio = 115; break;
-          case 7: base_prio = 60;  break;
-          default: base_prio = 50;
-        }
-
-      param.sched_priority = base_prio;
+      /* IMPORTANT: initialize thread scheduling priority to the task's base_prio */
+      param.sched_priority = base_prio_of_worker[i];
       pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
       pthread_attr_setschedparam(&attr, &param);
       pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
-      /* DEBUG: show thread config before creation */
-      printf("[FRAPDEMO] Creating worker %d: base_prio=%d, spin_prio "
-             "R0=%d R1=%d R2=%d R3=%d\n",
-             i, base_prio,
-             arrs[i][0], arrs[i][1], arrs[i][2], arrs[i][3]);
+      int *arg = malloc(sizeof(int) * RESOURCE_NUM);
+      if (arg == NULL)
+        {
+          printf("Failed to allocate arg for worker %d\n", i);
+          continue;
+        }
+      memcpy(arg, worker_prios[i], sizeof(int) * RESOURCE_NUM);
 
-      int ret = pthread_create(&workers[i], &attr,
-                               worker_table[i], (void *)arrs[i]);
+      int ret = pthread_create(&workers[i], &attr, worker_table[i], (void *)arg);
       if (ret != 0)
         {
-          printf("[FRAPDEMO] Failed to create worker %d (ret=%d)\n", i, ret);
+          printf("Create worker %d failed: %d\n", i, ret);
+          free(arg);
         }
-
       pthread_attr_destroy(&attr);
-      usleep(10000); /* stagger creation slightly */
+      usleep(20000);
     }
 
-  /* join all threads (they are finite loops so join will eventually return) */
+  /* 确保所有线程在同一时间开始请求资源 */
+  sleep(1);
+  pthread_mutex_lock(&start_lock);
+  start_flag = 1;
+  pthread_cond_broadcast(&start_cond);
+  pthread_mutex_unlock(&start_lock);
+
+  /* measure start time */
+  struct timespec tstart, tend;
+  clock_gettime(CLOCK_MONOTONIC, &tstart);
+
+  /* join threads */
   for (int i = 0; i < WORKER_NUM; i++)
     {
       pthread_join(workers[i], NULL);
-      /* DEBUG */
-      printf("[FRAPDEMO] worker %d joined\n", i);
     }
 
-  printf("[FRAPDEMO] demo finished\n");
+  clock_gettime(CLOCK_MONOTONIC, &tend);
+  double elapsed = (tend.tv_sec - tstart.tv_sec) + (tend.tv_nsec - tstart.tv_nsec) / 1e9;
+
+  /* compute theoretical totals from loops_for_worker & req pattern (matching JSON) */
+  uint64_t expected[RESOURCE_NUM] = {0};
+  /* hot0: idx0 requests R0 & R1 each loop */
+  expected[0] += (uint64_t)loops_for_worker[0]; expected[1] += (uint64_t)loops_for_worker[0];
+  /* hot1: idx1 requests R0 & R1 */
+  expected[0] += (uint64_t)loops_for_worker[1]; expected[1] += (uint64_t)loops_for_worker[1];
+  /* mid0: idx2 requests R0 & R2 */
+  expected[0] += (uint64_t)loops_for_worker[2]; expected[2] += (uint64_t)loops_for_worker[2];
+  /* mid1: idx3 requests R2 & R3 */
+  expected[2] += (uint64_t)loops_for_worker[3]; expected[3] += (uint64_t)loops_for_worker[3];
+  /* remoteA0: idx4 requests R1 */
+  expected[1] += (uint64_t)loops_for_worker[4];
+  /* remoteA1: idx5 requests R1 & R3 */
+  expected[1] += (uint64_t)loops_for_worker[5]; expected[3] += (uint64_t)loops_for_worker[5];
+  /* remoteB0: idx6 requests R1 twice per loop */
+  expected[1] += (uint64_t)loops_for_worker[6] * 2ULL;
+  /* background: idx7 requests R3 */
+  expected[3] += (uint64_t)loops_for_worker[7];
+
+  printf("\n[FRAPTEST] Results (elapsed %.3f s):\n", elapsed);
+  for (int r = 0; r < RESOURCE_NUM; r++)
+    {
+      // 所有任务访问资源的总次数 / 所有任务跑完的时间
+      double throughput = (double)g_counter[r] / elapsed;
+      printf(" Resource R%d: counted=%llu expected=%llu throughput=%.2f entries/s %s\n",
+             r,
+             (unsigned long long)g_counter[r],
+             (unsigned long long)expected[r],
+             throughput,
+             (g_counter[r] == expected[r]) ? "[OK]" : "[MISMATCH]");
+    }
+
+  /* sanity: total expected vs counted */
+  uint64_t total_expected = 0, total_counted = 0;
+  for (int r = 0; r < RESOURCE_NUM; r++) { total_expected += expected[r]; total_counted += g_counter[r]; }
+  printf("[FRAPTEST] Total counted=%llu expected=%llu\n",
+         (unsigned long long)total_counted, (unsigned long long)total_expected);
+  printf("[FRAPTEST] Total throughput=%.2f\n",total_counted / elapsed);
+  printf("[FRAPTEST] demo finished\n");
   return 0;
 }
