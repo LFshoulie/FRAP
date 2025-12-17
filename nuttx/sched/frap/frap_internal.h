@@ -31,6 +31,7 @@
  *   uint8_t              frap_base_prio;
  *   uint8_t              frap_spin_prio;
  *   uint8_t              frap_saved_prio;
+ *   volatile uint8_t     frap_wait_lock;
  *   bool                 frap_in_cs;
  *   bool                 frap_enqueued;
  *   bool                 frap_cancelled;

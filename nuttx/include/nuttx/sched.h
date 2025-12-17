@@ -743,6 +743,11 @@ struct tcb_s
   /* 本地 PCP 变体：进入临界段前保存的优先级 */
   uint8_t               frap_saved_prio;
 
+    /* MCS-style local waiting flag:
+   * 1 = keep waiting (spin/yield), 0 = woken up / allowed to try acquire
+   */
+  volatile uint8_t frap_wait_lock;
+
   /* 标志位 */
   bool                  frap_in_cs;      /* 已进入 FRAP 临界段（sched_lock 中） */
   bool                  frap_enqueued;   /* 已挂在某个资源的 FIFO 队列中 */
