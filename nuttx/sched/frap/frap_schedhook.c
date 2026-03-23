@@ -32,10 +32,8 @@ void frap_on_preempt(FAR struct tcb_s *oldtcb, FAR struct tcb_s *newtcb)
   FAR struct frap_res *r;
   irqstate_t           flags;
 
-  if (oldtcb == NULL || newtcb == NULL)
-    {
-      return;
-    }
+  /* 调度器保证不应为空 */
+  DEBUGASSERT(oldtcb != NULL && newtcb != NULL);
 
   /* 只有更高优先级任务抢占才会影响 FRAP 自旋 */
 
@@ -45,17 +43,13 @@ void frap_on_preempt(FAR struct tcb_s *oldtcb, FAR struct tcb_s *newtcb)
     }
 
   /* 如果 oldtcb 不在 FRAP 自旋队列中，或者已经在临界段内，则无需处理 */
-
   if (!oldtcb->frap_enqueued || oldtcb->frap_in_cs)
-    {
-      return;
-    }
+  {
+    return;
+  }
 
   r = oldtcb->frap_waiting_res;
-  if (r == NULL)
-    {
-      return;
-    }
+  DEBUGASSERT(r != NULL);
 
   /* 在资源自旋锁保护下安全地将其从 FIFO 中移除 */
 
