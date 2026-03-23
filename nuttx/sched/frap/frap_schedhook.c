@@ -31,7 +31,6 @@ void frap_on_preempt(FAR struct tcb_s *oldtcb, FAR struct tcb_s *newtcb)
 {
   FAR struct frap_res *r;
   irqstate_t           flags;
-  FAR struct tcb_s    *head;
 
   if (oldtcb == NULL || newtcb == NULL)
     {
@@ -66,25 +65,23 @@ void frap_on_preempt(FAR struct tcb_s *oldtcb, FAR struct tcb_s *newtcb)
     {
       frap_queue_remove(r, oldtcb);
       oldtcb->frap_cancelled = true;
-      /* 该结点已被取消：回到等待状态 */
-      oldtcb->frap_wait_lock = 1;
+      /* 被更高优先级任务抢占过一次（由 frap_on_preempt 处理） */
+      oldtcb->frap_queue_preempt_cnt++;
     }
-
-  /* 若资源当前空闲，则确保新的队头被唤醒（避免队列“全睡”） */
-
-  if (r->owner == NULL)
-    {
-      head = frap_queue_peek_head(r);
-      if (head != NULL)
-        {
-          head->frap_wait_lock = 0;
-        }
-    }
+    
+    
 
   spin_unlock_irqrestore(&r->sl, flags);
 
   /* 恢复基准优先级 P_i */
   frap_set_prio(oldtcb, oldtcb->frap_base_prio);
+
+  sinfo("FRAP preempt: old=%d (spin=%u->base=%u) by new=%d, resid=%u\n",
+        oldtcb->pid,
+        (unsigned)oldtcb->frap_spin_prio,
+        (unsigned)oldtcb->frap_base_prio,
+        newtcb->pid,
+        r ? (unsigned)r->id : 0);
 }
 
 #endif /* CONFIG_FRAP */

@@ -66,6 +66,7 @@ void frap_queue_remove(FAR struct frap_res *r, FAR struct tcb_s *tcb)
 }
 
 /* 取得队头任务（如果有）。 */
+
 FAR struct tcb_s *frap_queue_peek_head(FAR struct frap_res *r)
 {
   DEBUGASSERT(r != NULL);

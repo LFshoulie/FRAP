@@ -728,30 +728,22 @@ struct tcb_s
 #endif
 
 #ifdef CONFIG_FRAP
-  /* FRAP 协议的每任务状态 */
-
-  /* 当前正在等待的 FRAP 资源（仅在自旋阶段非 NULL） */
-  FAR struct frap_res *frap_waiting_res;
-
-  /* 用于挂到资源 FIFO 的队列结点（list 循环链表） */
-  struct list_node      frap_waiter_node;
-
-  /* 全局 FRAP：基准优先级 P_i、自旋优先级 P_i^k */
-  uint8_t               frap_base_prio;
-  uint8_t               frap_spin_prio;
-
-  /* 本地 PCP 变体：进入临界段前保存的优先级 */
-  uint8_t               frap_saved_prio;
-
-    /* MCS-style local waiting flag:
-   * 1 = keep waiting (spin/yield), 0 = woken up / allowed to try acquire
-   */
-  volatile uint8_t frap_wait_lock;
-
-  /* 标志位 */
-  bool                  frap_in_cs;      /* 已进入 FRAP 临界段（sched_lock 中） */
-  bool                  frap_enqueued;   /* 已挂在某个资源的 FIFO 队列中 */
-  bool                  frap_cancelled;  /* 因抢占被从队列移除，需要重新排队 */
+      /* FRAP 协议的每任务状态 */
+      /* 当前正在等待的 FRAP 资源（仅在自旋阶段非 NULL） */
+      FAR struct frap_res *frap_waiting_res;
+      /* 用于挂到资源 FIFO 的队列结点（list 循环链表） */
+      struct list_node      frap_waiter_node;
+      /* 全局 FRAP：基准优先级 P_i、自旋优先级 P_i^k */
+      uint8_t               frap_base_prio;
+      uint8_t               frap_spin_prio;
+      /* 本地 PCP 变体：进入临界段前保存的优先级 */
+      uint8_t               frap_saved_prio;
+      /* 标志位 */
+      bool                  frap_in_cs;                  /* 已进入 FRAP 临界段（sched_lock 中） */
+      bool                  frap_enqueued;               /* 已挂在某个资源的 FIFO 队列中 */
+      bool                  frap_cancelled;              /* 因抢占被从队列移除，需要重新排队 */
+      /* [新增] 统计：在 FIFO 队列排队期间被抢占的次数 */
+      uint32_t  frap_queue_preempt_cnt;
 #endif
 
 };

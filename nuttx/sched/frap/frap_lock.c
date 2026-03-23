@@ -28,6 +28,18 @@
  * 调用者必须在 frap_unlock() 之前保持语义上的“临界段”。
  ****************************************************************************/
 
+/****************************************************************************
+ * Name: frap_get_queue_preempt_count
+ *
+ * [新增] 专门给测试程序使用的辅助函数
+ * 用于获取当前任务的排队抢占计数
+ ****************************************************************************/
+uint32_t frap_get_queue_preempt_count(void)
+{
+  FAR struct tcb_s *tcb = this_task();
+  return tcb->frap_queue_preempt_cnt;
+}
+
 int frap_lock(FAR struct frap_res *r)
 {
   FAR struct tcb_s *tcb;
@@ -56,8 +68,6 @@ int frap_lock(FAR struct frap_res *r)
   tcb->frap_spin_prio   = spin_prio;
   tcb->frap_cancelled   = false;
   tcb->frap_in_cs       = false;
-  /* 等待标志：1=继续等待，0=被唤醒/可尝试获取资源 */
-  tcb->frap_wait_lock   = 1;
 
   DEBUGASSERT(!tcb->frap_enqueued);
 
@@ -67,100 +77,63 @@ int frap_lock(FAR struct frap_res *r)
 
   for (;;)
     {
-      /*
-       * MCS 风格等待：
-       * - 队列/owner 的检查、入队/出队、唤醒后继仅在 r->sl 保护下发生
-       * - 等待阶段仅自旋本地标志 frap_wait_lock（可被抢占）
-       */
+      /* * 检查是否曾被抢占取消 (Cancel-on-Preempt)。
+        * 如果是，说明我们在 hook 中被降级回了 base_prio。
+        * 根据 FRAP 协议 Lemma 4，恢复运行时必须 "re-issue request"，
+        * 因此必须立即将优先级重新提升回 spin_prio。
+      */
+      if (tcb->frap_cancelled)
+      {
+        tcb->frap_cancelled = false;
+        frap_set_prio(tcb, spin_prio);
+      }
+      bool can_enter = false;
+
+      /* 短临界区：检查资源状态并操作 FIFO */
 
       flags = spin_lock_irqsave(&r->sl);
 
-      /* 若尚未入队：尝试快速获取；否则一次性入队并设置本地等待标志 */
-
-      if (!tcb->frap_enqueued)
+      if (r->owner == NULL)
         {
           FAR struct tcb_s *head = frap_queue_peek_head(r);
 
-          if (r->owner == NULL && head == NULL)
+          if (head == NULL)
             {
-              /* 无 owner 且队列为空：直接占有资源 */
-              r->owner = tcb;
-
-              /* R2: 非抢占执行临界段（同核不可被更高优先级打断） */
-              sched_lock();
-              tcb->frap_in_cs = true;
-
-              spin_unlock_irqrestore(&r->sl, flags);
-              return OK;
+              /* 队列为空：自己占队头并立即进入临界段 */
+              frap_queue_enqueue_head_if_needed(r, tcb);
+              can_enter = true;
             }
-
-          /* 入队：默认等待，后继由前驱/释放者唤醒 */
-          tcb->frap_wait_lock = 1;
-          frap_queue_enqueue_tail(r, tcb);
-
-          /* 若资源空闲且自己成为队头，则允许立即尝试获取 */
-          if (r->owner == NULL && frap_queue_peek_head(r) == tcb)
+          else if (head == tcb)
             {
-              tcb->frap_wait_lock = 0;
-            }
-        }
-      else
-        {
-          /* 兜底：若资源空闲且自己是队头，确保被允许尝试 */
-          if (r->owner == NULL && frap_queue_peek_head(r) == tcb)
-            {
-              tcb->frap_wait_lock = 0;
+              /* 已经是队头，直接进入 */
+              can_enter = true;
             }
 
         }
 
-      spin_unlock_irqrestore(&r->sl, flags);
-
-      /* 等待阶段：仅自旋本地标志，避免所有等待者反复争抢 r->sl */
-
-      while (tcb->frap_wait_lock != 0)
+      if (can_enter)
         {
-          if (tcb->frap_cancelled)
-            {
-              break;
-            }
-
-          sched_yield();
-        }
-
-      if (tcb->frap_cancelled)
-        {
-          /* 被更高优先级任务抢占：已由 frap_on_preempt 出队并降回 base */
-          tcb->frap_cancelled = false;
-          tcb->frap_wait_lock = 1;
-
-          /* 重新进入自旋阶段：恢复到自旋优先级 */
-          frap_set_prio(tcb, tcb->frap_spin_prio);
-          continue;
-        }
-
-      /* 被唤醒：尝试获取资源（短临界区） */
-
-      flags = spin_lock_irqsave(&r->sl);
-
-      if (tcb->frap_enqueued && r->owner == NULL &&
-          frap_queue_peek_head(r) == tcb)
-        {
+          /* 从队列摘除并占有资源 */
           frap_queue_remove(r, tcb);
           r->owner = tcb;
 
+          /* R2: 非抢占执行临界段（同核不可被更高优先级打断） */
           sched_lock();
           tcb->frap_in_cs = true;
 
           spin_unlock_irqrestore(&r->sl, flags);
+
           return OK;
         }
 
-      /* 未能进入：回到等待状态（后续由释放者/抢占钩子重新唤醒） */
-      tcb->frap_wait_lock = 1;
+      /* 不能进入：确保在 FIFO 尾部排队，然后自愿让出 CPU */
+
+      frap_queue_enqueue_tail(r, tcb);
+
       spin_unlock_irqrestore(&r->sl, flags);
 
-      sched_yield();
+      /* 自愿调度，等待下一次被调度后继续尝试 */
+      // sched_yield();
     }
 }
 
@@ -170,35 +143,32 @@ int frap_lock(FAR struct frap_res *r)
  * 对应 frap_lock 的解锁操作。
  ****************************************************************************/
 
-void frap_unlock(struct frap_res *r)
+void frap_unlock(FAR struct frap_res *r)
 {
-  struct tcb_s *tcb = this_task();
-  irqstate_t flags;
-  FAR struct tcb_s *head;
+  FAR struct tcb_s *tcb;
+  irqstate_t        flags;
 
-  DEBUGASSERT(r->owner == tcb && tcb->frap_in_cs);
+  DEBUGASSERT(r != NULL && r->is_global);
 
-  /* 先释放资源（仍处于 sched_lock 保护下） */
-  flags = spin_lock_irqsave(&r->sl);
-  r->owner = NULL;
+  tcb = this_task();
 
-  /* 唤醒队头：前驱/释放者通知后继（MCS 思想） */
-  head = frap_queue_peek_head(r);
-  if (head != NULL)
-    {
-      head->frap_wait_lock = 0;
-    }
+  DEBUGASSERT(r->owner == tcb);
+  DEBUGASSERT(tcb->frap_in_cs);
 
-  spin_unlock_irqrestore(&r->sl, flags);
-
-  /* 再退出非抢占区 */
+  /* 先退出非抢占区，再释放资源 */
   tcb->frap_in_cs = false;
   sched_unlock();
 
+  /* 清空 owner，唤醒后续等待者由其自行争抢 */
+  flags    = spin_lock_irqsave(&r->sl);
+  r->owner = NULL;
+  spin_unlock_irqrestore(&r->sl, flags);
+
+  /* 恢复基准优先级 P_i */
   frap_set_prio(tcb, tcb->frap_base_prio);
+
   tcb->frap_waiting_res = NULL;
 }
-
 
 /****************************************************************************
  * Name: frap_local_lock
